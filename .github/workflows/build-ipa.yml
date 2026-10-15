@@ -1,0 +1,132 @@
+# 在 GitHub 的 macOS runner 上把 HelloWorld 编成 IPA，并发布到 Releases
+#
+# 不需要 App Store Connect API Key，不需要证书，不需要描述文件，不需要任何 Secret。
+# 公开仓库的 macOS runner 免费且不限量。
+
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 创建 Release 和上传资产需要写权限
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 打印环境信息，出问题时方便定位是 Xcode 还是 SDK 的问题
+      - name: 环境信息
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # 关键：完全不签名地构建。
+      # CODE_SIGNING_ALLOWED=NO 让 Xcode 跳过 codesign 环节，
+      # 所以我们既不需要证书也不需要描述文件。
+      #
+      # 用 -target 而不是 -scheme，是为了避免依赖 scheme 文件；
+      # 构建产物直接输出到 build/Release-iphoneos/
+      - name: 构建未签名 .app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project HelloWorld.xcodeproj \
+            -target HelloWorld \
+            -configuration Release \
+            -sdk iphoneos \
+            CONFIGURATION_BUILD_DIR="$PWD/build/Release-iphoneos" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 确认产物存在
+        run: |
+          set -euo pipefail
+          ls -la build/Release-iphoneos/
+          test -d build/Release-iphoneos/HelloWorld.app
+          echo "✅ HelloWorld.app 已生成"
+
+      # 把 .app 打成 IPA（Payload 目录 + zip）
+      - name: 打包成 IPA
+        run: |
+          set -euo pipefail
+          bash scripts/make-ipa.sh \
+            build/Release-iphoneos/HelloWorld.app \
+            build/ipa/HelloWorld-unsigned.ipa
+
+      # 打印包信息，方便核对
+      - name: 输出包信息
+        run: |
+          set -euo pipefail
+          APP=build/Release-iphoneos/HelloWorld.app
+          echo "Bundle ID : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' $APP/Info.plist)"
+          echo "版本      : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' $APP/Info.plist)"
+          echo "构建号    : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' $APP/Info.plist)"
+          echo "最低系统  : $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' $APP/Info.plist)"
+          echo ""
+          echo "签名状态（预期为 not signed）："
+          codesign -dv "$APP" 2>&1 || true
+
+      - name: 上传为构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: HelloWorld-unsigned-ipa
+          path: build/ipa/*.ipa
+          retention-days: 30
+
+      # 发布到 Releases。
+      # 用 gh CLI 而不是第三方 action，减少外部依赖。
+      # 逻辑写成幂等的：已存在就覆盖资产，不存在就新建，方便反复重跑。
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v1.0.0"
+
+          NOTES=$(cat <<'EOF'
+          ## Hello World iOS
+
+          一个用 SwiftUI 编写的极简 iOS 应用，由 GitHub Actions 的 macOS runner 自动编译。
+
+          ### 构建信息
+          - 构建方式：`xcodebuild` 完全未签名构建（`CODE_SIGNING_ALLOWED=NO`）
+          - 目标平台：iOS 15.0+
+          - 架构：arm64
+
+          ### 关于这个 IPA
+          这是**未签名**的 IPA，无法直接双击安装，需要自行签名后才能装到设备：
+
+          **未越狱设备**：用 Sideloadly / AltStore / 爱思助手，填自己的 Apple ID 重签后安装。
+          免费 Apple ID 签的有效期是 7 天，到期需重签。
+
+          **已越狱设备**：安装 AppSync Unified 后可直接安装。
+
+          ⚠️ 仅供个人测试学习使用，请勿用于分发。
+          EOF
+          )
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，覆盖 IPA 资产"
+            gh release upload "$TAG" build/ipa/*.ipa --clobber
+          else
+            echo "创建 Release $TAG"
+            gh release create "$TAG" \
+              --title "Hello World iOS $TAG" \
+              --notes "$NOTES" \
+              build/ipa/*.ipa
+          fi
+
+          echo "✅ 完成：$(gh release view "$TAG" --json url -q .url)"
