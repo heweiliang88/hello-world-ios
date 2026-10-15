@@ -16,7 +16,19 @@ fi
 APP_PATH="${1%/}"
 APP_NAME="$(basename "$APP_PATH")"
 EXEC_NAME="${APP_NAME%.app}"
-OUT_IPA="${2:-$(pwd)/${EXEC_NAME}-unsigned.ipa}"
+OUT_IPA="${2:-${EXEC_NAME}-unsigned.ipa}"
+
+# 关键：转成绝对路径。
+# 后面压缩时会在子 shell 里 cd 到临时目录，相对路径届时会失效 ——
+# 这正是 zip 报 "Could not create output file" 的原因。
+abs() {
+  case "$1" in
+    /*) printf '%s' "$1" ;;
+    *)  printf '%s/%s' "$(pwd)" "${1#./}" ;;
+  esac
+}
+APP_PATH="$(abs "$APP_PATH")"
+OUT_IPA="$(abs "$OUT_IPA")"
 
 if [[ ! -d "$APP_PATH" ]]; then
   echo "❌ 找不到 .app 目录: $APP_PATH" >&2
